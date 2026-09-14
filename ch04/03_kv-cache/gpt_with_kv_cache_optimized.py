@@ -37,6 +37,12 @@ class MultiHeadAttention(nn.Module):
     def forward(self, x, use_cache=False):
         b, num_tokens, d_in = x.shape
 
+        if use_cache:
+            # to prevent self.ptr_cur became negative
+            assert num_tokens <= self.window_size, (
+                f"Input chunk size ({num_tokens}) exceeds KV cache window size ({self.window_size}). "
+            )
+
         keys_new = self.W_key(x)  # Shape: (b, num_tokens, d_out)
         values_new = self.W_value(x)
         queries = self.W_query(x)
@@ -80,8 +86,6 @@ class MultiHeadAttention(nn.Module):
             keys, values = keys_new, values_new
             self.ptr_cur = 0  # keep pointer sane if you interleave modes
         ####################################################
-
-
         # Compute scaled dot-product attention (aka self-attention) with a causal mask
         attn_scores = queries @ keys.transpose(2, 3)  # Dot product for each head
 
@@ -173,7 +177,8 @@ class TransformerBlock(nn.Module):
             num_heads=cfg["n_heads"],
             dropout=cfg["drop_rate"],
             qkv_bias=cfg["qkv_bias"],
-            window_size=cfg["kv_window_size"])  # NEW
+            window_size=cfg["kv_window_size"] if "kv_window_size" in cfg else cfg["context_length"]   # NEW
+        )
         self.ff = FeedForward(cfg)
         self.norm1 = LayerNorm(cfg["emb_dim"])
         self.norm2 = LayerNorm(cfg["emb_dim"])
@@ -222,6 +227,7 @@ class GPTModel(nn.Module):
 
         self.final_norm = LayerNorm(cfg["emb_dim"])
         self.out_head = nn.Linear(cfg["emb_dim"], cfg["vocab_size"], bias=False)
+        self.kv_window_size = cfg["kv_window_size"]  if "kv_window_size" in cfg else cfg["context_length"]
 
     def forward(self, in_idx, use_cache=False):
         batch_size, seq_len = in_idx.shape
@@ -233,6 +239,12 @@ class GPTModel(nn.Module):
         # NEW
 
         if use_cache:
+            context_length = self.pos_emb.num_embeddings
+            # to prevent generate more sequence than context_length
+            # since longer than context_length will cause model out of bound error when reading the position embedding
+            assert self.ptr_current_pos + seq_len <= context_length, (
+                f"Position embedding overflow. Want to read {self.ptr_current_pos + seq_len} which excceded size of {context_length}"
+            )
             pos_ids = torch.arange(self.ptr_current_pos, self.ptr_current_pos + seq_len, device=in_idx.device, dtype=torch.long)
             self.ptr_current_pos += seq_len
         else:
@@ -291,30 +303,38 @@ def generate_text_simple(model, idx, max_new_tokens, context_size):
 
 ####################################################
 # NEW
-def generate_text_simple_cached(model, idx, max_new_tokens, use_cache=True):
+def generate_text_simple_cached(model, idx, max_new_tokens, context_size=None, use_cache=True):
     model.eval()
 
-    ctx_len = model.pos_emb.num_embeddings  # max supported length, e.g. 1024
-    if use_cache:
-        # Init cache with full prompt
-        model.reset_kv_cache()
-        with torch.no_grad():
-            logits = model(idx[:, -ctx_len:], use_cache=True)
+    ctx_len = context_size or model.pos_emb.num_embeddings
+    kv_window_size = model.kv_window_size
 
-        for _ in range(max_new_tokens):
-            # a) pick the token with the highest log-probability (greedy sampling)
-            next_idx = logits[:, -1].argmax(dim=-1, keepdim=True)
-            # b) append it to the running sequence
-            idx = torch.cat([idx, next_idx], dim=1)
-            # c) feed model only the new token
-            with torch.no_grad():
+    with torch.no_grad():
+        if use_cache:
+            model.reset_kv_cache()
+
+            input_tokens = idx[:, -ctx_len:]
+            input_tokens_length = input_tokens.size(1)
+
+            # prefill to handle input_tokens_length > kv_window_size
+            for i in range(0, input_tokens_length, kv_window_size):
+                chunk = input_tokens[:, i:i+kv_window_size]
+                logits = model(chunk, use_cache=True)
+
+            # can't generate more than ctx_len of result
+            # due to the limitation of position embedding
+            max_generable = ctx_len - input_tokens_length
+            max_new_tokens = min(max_new_tokens, max_generable)
+
+            for _ in range(max_new_tokens):
+                next_idx = logits[:, -1].argmax(dim=-1, keepdim=True)
+                idx = torch.cat([idx, next_idx], dim=1)
                 logits = model(next_idx, use_cache=True)
-    else:
-        for _ in range(max_new_tokens):
-            with torch.no_grad():
+        else:
+            for _ in range(max_new_tokens):
                 logits = model(idx[:, -ctx_len:], use_cache=False)
-            next_idx = logits[:, -1].argmax(dim=-1, keepdim=True)
-            idx = torch.cat([idx, next_idx], dim=1)
+                next_idx = logits[:, -1].argmax(dim=-1, keepdim=True)
+                idx = torch.cat([idx, next_idx], dim=1)
 
     return idx
 ####################################################
